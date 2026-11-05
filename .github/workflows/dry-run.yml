@@ -1,0 +1,116 @@
+# Dry run of nightgauge/nightgauge's release-scan-gate.sh (nightgauge/nightgauge#2946).
+#
+# Runs the merged gate, checked out from the core at a pinned commit, against
+# this repository's own draft releases:
+#   clean      a draft holding one unique text file: the scan is clean and the
+#              gate publishes the draft; `verify` then passes on it.
+#   detection  a draft holding the EICAR antivirus test string: the scan reports
+#              detections, the gate exits 1, the draft stays a draft, and
+#              `verify` refuses it.
+# Sequential, because both jobs share one free VirusTotal key (4 requests/min).
+name: release-scan-gate dry run
+
+on:
+  workflow_dispatch:
+    inputs:
+      core_ref:
+        description: nightgauge/nightgauge commit whose scripts/release-scan-gate.sh runs
+        required: true
+        default: 4e3ac96fb344ddb990763e6f91cd5d3b3b27364c
+
+permissions:
+  contents: write
+
+env:
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  clean:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      VT_API_KEY: ${{ secrets.VT_API_KEY }}
+      TAG: v0.0.${{ github.run_number }}-clean
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: nightgauge/nightgauge
+          ref: ${{ inputs.core_ref }}
+          path: core
+          persist-credentials: false
+
+      - name: Draft a release with one clean file and its checksums.txt
+        run: |
+          mkdir out && cd out
+          printf 'release-scan-gate dry run for nightgauge/nightgauge#2946\nrun %s attempt %s at %s\n' \
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$(date -u +%FT%TZ)" > clean.txt
+          sha256sum clean.txt > checksums.txt
+          cat checksums.txt
+          gh release create "$TAG" clean.txt checksums.txt -R "$GITHUB_REPOSITORY" --draft \
+            --target "$GITHUB_SHA" --title "$TAG" --notes "Dry run, clean case (nightgauge/nightgauge#2946)"
+          test "$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json isDraft -q .isDraft)" = true
+
+      - name: Scan gate (expect exit 0 and a published release)
+        run: |
+          set +e
+          bash core/scripts/release-scan-gate.sh scan "$TAG" -R "$GITHUB_REPOSITORY" --report "$RUNNER_TEMP/report.json"
+          rc=$?
+          set -e
+          echo "release-scan-gate scan exit: $rc"
+          jq . "$RUNNER_TEMP/report.json" || true
+          draft="$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json isDraft -q .isDraft)"
+          echo "isDraft after the scan: $draft"
+          [ "$rc" -eq 0 ] && [ "$draft" = false ] || { echo "::error::expected exit 0 and a published release"; exit 1; }
+
+      - name: Verify (expect exit 0)
+        run: bash core/scripts/release-scan-gate.sh verify "$TAG" -R "$GITHUB_REPOSITORY"
+
+  detection:
+    needs: clean
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      VT_API_KEY: ${{ secrets.VT_API_KEY }}
+      TAG: v0.0.${{ github.run_number }}-detection
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: nightgauge/nightgauge
+          ref: ${{ inputs.core_ref }}
+          path: core
+          persist-credentials: false
+
+      - name: Draft a release carrying the EICAR test string
+        run: |
+          mkdir out && cd out
+          # The standard EICAR antivirus test file (68 bytes), stored base64 so
+          # this repository's tree does not carry it.
+          printf '%s' 'WDVPIVAlQEFQWzRcUFpYNTQoUF4pN0NDKTd9JEVJQ0FSLVNUQU5EQVJELUFOVElWSVJVUy1URVNULUZJTEUhJEgrSCo=' | base64 -d > eicar.com
+          echo "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f  eicar.com" | sha256sum -c -
+          sha256sum eicar.com > checksums.txt
+          gh release create "$TAG" eicar.com checksums.txt -R "$GITHUB_REPOSITORY" --draft \
+            --target "$GITHUB_SHA" --title "$TAG" --notes "Dry run, detection case (nightgauge/nightgauge#2946)"
+          test "$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json isDraft -q .isDraft)" = true
+
+      - name: Scan gate (expect exit 1 and the release still a draft)
+        run: |
+          set +e
+          bash core/scripts/release-scan-gate.sh scan "$TAG" -R "$GITHUB_REPOSITORY" --report "$RUNNER_TEMP/report.json"
+          rc=$?
+          set -e
+          echo "release-scan-gate scan exit: $rc"
+          jq . "$RUNNER_TEMP/report.json" || true
+          draft="$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json isDraft -q .isDraft)"
+          echo "isDraft after the scan: $draft"
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets -q '.assets[].name'
+          [ "$rc" -eq 1 ] && [ "$draft" = true ] || { echo "::error::expected exit 1 and the release still a draft"; exit 1; }
+
+      - name: Verify refuses the draft (expect exit 1)
+        run: |
+          set +e
+          bash core/scripts/release-scan-gate.sh verify "$TAG" -R "$GITHUB_REPOSITORY"
+          rc=$?
+          set -e
+          echo "release-scan-gate verify exit: $rc"
+          [ "$rc" -eq 1 ] || { echo "::error::expected verify to refuse the draft with exit 1"; exit 1; }
